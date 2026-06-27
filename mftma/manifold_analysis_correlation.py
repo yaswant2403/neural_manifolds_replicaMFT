@@ -11,9 +11,10 @@ from scipy.linalg import qr
 from functools import partial
 
 from cvxopt import solvers, matrix
+from pymanopt.function import autograd as pymanopt_autograd
 from pymanopt.manifolds import Stiefel
 from pymanopt import Problem
-from pymanopt.solvers import ConjugateGradient
+from pymanopt.optimizers import ConjugateGradient
 
 # Configure cvxopt solvers
 solvers.options['show_progress'] = False
@@ -334,6 +335,7 @@ def fun_FA(centers, maxK, max_iter, n_repeats, s_all=None, verbose=False, conjug
     V1 = None
     for i in range(1, maxK + 1):
         best_stability = 0
+        best_V1 = None
 
         for j in range(1, n_repeats + 1):
             # Sample a random normal vector unless one is supplied
@@ -367,7 +369,7 @@ def fun_FA(centers, maxK, max_iter, n_repeats, s_all=None, verbose=False, conjug
             stability = min(np.sqrt(np.sum(np.square(X0), axis=1))/denom)
 
             # Store the solution if it has the best stability
-            if stability > best_stability:
+            if best_V1 is None or stability > best_stability:
                 best_stability = stability
                 best_V1 = V1tmp
             if n_repeats > 1 and verbose:
@@ -406,6 +408,25 @@ def fun_FA(centers, maxK, max_iter, n_repeats, s_all=None, verbose=False, conjug
             break
     return norm_coeff, norm_coeff_vec, q[:, 0:P-1], V1_mat, res_coeff, res_coeff0
 
+def _decorate_cost_function(cost_fn, manifold):
+    return pymanopt_autograd(manifold)(cost_fn)
+
+
+def _make_solver(solver_cls, kwargs):
+    return solver_cls(
+        max_iterations=kwargs.get('max_iter', 1000),
+        min_gradient_norm=kwargs.get('gtol', 1e-6),
+        min_step_size=kwargs.get('xtol', 1e-6),
+        verbosity=kwargs.get('verbosity', 0),
+        log_verbosity=kwargs.get('log_verbosity', 0),
+    )
+
+
+def _solve_problem(problem, solver, initial_point):
+    result = solver.run(problem, initial_point=initial_point)
+    return result.point
+
+
 def CGmanopt(X, objective_function, A, **kwargs):
     '''
     Minimizes the objective function subject to the constraint that X.T * X = I_k using the
@@ -424,12 +445,18 @@ def CGmanopt(X, objective_function, A, **kwargs):
     '''
 
     manifold = Stiefel(X.shape[0], X.shape[1])
+
     def cost(X):
         c, _ = objective_function(X, A)
         return c
-    problem = Problem(manifold=manifold, cost=cost, verbosity=0)
-    solver = ConjugateGradient(logverbosity=0)
-    Xopt = solver.solve(problem)
+
+    cost = _decorate_cost_function(cost, manifold)
+    problem = Problem(manifold=manifold, cost=cost)
+    solver = _make_solver(ConjugateGradient, kwargs)
+    Xopt = _solve_problem(problem, solver, X)
+    Xopt = np.asarray(Xopt)
+    if Xopt.ndim == 1:
+        Xopt = Xopt.reshape(-1, 1)
     return Xopt, None
 
 
@@ -449,10 +476,13 @@ def square_corrcoeff_full_cost(V, X, grad=True):
     assert N_v == N
 
     # Calculate the cost
+    eps = 1e-12
     C = np.matmul(X, X.T)
     c = np.matmul(X, V)
     c0 = np.diagonal(C).reshape(P, 1) - np.sum(np.square(c), axis=1, keepdims=True)
-    Fmn = np.square(C - np.matmul(c, c.T))/np.matmul(c0, c0.T)
+    denom = np.matmul(c0, c0.T)
+    denom = np.where(np.abs(denom) > eps, denom, eps)
+    Fmn = np.square(C - np.matmul(c, c.T))/denom
     cost = np.sum(Fmn)/2
 
     if grad is False:  # skip gradient calc since not needed, or autograd is used
@@ -465,8 +495,8 @@ def square_corrcoeff_full_cost(V, X, grad=True):
         C2 = np.reshape(c, [1, P, 1, K])
 
         # Sum the terms in the gradient
-        PF1 = ((C - np.matmul(c, c.T))/np.matmul(c0, c0.T)).reshape(P, P, 1, 1) 
-        PF2 = (np.square(C - np.matmul(c, c.T))/np.square(np.matmul(c0, c0.T))).reshape(P, P, 1, 1)
+        PF1 = ((C - np.matmul(c, c.T))/denom).reshape(P, P, 1, 1)
+        PF2 = (np.square(C - np.matmul(c, c.T))/np.square(denom)).reshape(P, P, 1, 1)
         Gmni = - PF1 * C1 * X1
         Gmni += - PF1 * C2 * X2
         Gmni +=  PF2 * c0.reshape(P, 1, 1, 1) * C2 * X1
